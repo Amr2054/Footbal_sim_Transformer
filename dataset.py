@@ -1,75 +1,66 @@
 import torch
-from torch.utils.data import Dataset, DataLoader
-import numpy as np
+from torch.utils.data import Dataset
+import os
+import gc
 
 
-class TacticalPlayDataset(Dataset):
-    def __init__(self, plays_list, target_frames=250):
-        """
-        plays_list: The list of dictionaries returned by generate_play_tensors()
-        target_frames: The fixed sequence length we want for our Transformer (e.g., 100 frames)
-        """
-        self.plays = plays_list
+class FIFASequenceDataset(Dataset):
+    def __init__(self, data_dir, target_frames=100):
         self.target_frames = target_frames
 
+
+        self.all_tensors = []
+        self.all_seq_ids = []
+
+        print("Loading matches into memory.")
+        # Find all match files in the DataBase folder
+        file_paths = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.pt')]
+
+        # Load each match and append its sequences to our master list
+        for path in file_paths:
+            match_sequences = torch.load(path,weights_only=False)  # Loads the list of dicts
+
+
+            for seq_dict in match_sequences:
+                self.all_tensors.append(seq_dict['tracking_data'])
+                self.all_seq_ids.append(seq_dict['sequence'])
+
+            # Delete the heavy dictionary list from RAM immediately
+            del match_sequences
+
+        # Force Python to clean up the deleted dictionaries from memory
+        gc.collect()
+
+        print(f"Loaded {len(self.all_tensors)} total plays across {len(file_paths)} matches!")
+
     def __len__(self):
-        return len(self.plays)
+        return len(self.all_tensors)
 
     def __getitem__(self, idx):
-        play = self.plays[idx]
-        coords = play['coordinates']  # Shape: (N, 23, 2)
-        roles = play['roles']  # Shape: (N, 23)
+        # Grab the raw tensor and ID directly from our stripped lists
+        raw_tensor = self.all_tensors[idx]  # Shape: [T, 23, 4]
+        seq_id = self.all_seq_ids[idx]
 
-        current_frames = coords.shape[0]
+        current_frames = raw_tensor.shape[0]
 
-        # Initialize empty arrays of our target size
-        # Coords padded with 0.0, Roles padded with -1 (or a dummy index)
-        fixed_coords = np.zeros((self.target_frames, 23, 2), dtype=np.float32)
-        fixed_roles = np.zeros((self.target_frames, 23), dtype=np.int64)
+        # Initialize empty arrays for padding
+        fixed_coords = torch.zeros((self.target_frames, 23, 2), dtype=torch.float32)
+        fixed_roles = torch.zeros((self.target_frames, 23), dtype=torch.int64)
 
-        # Create an Attention Mask (1 means real data, 0 means padding)
-        # Transformers use this so they don't learn from the padded zeros
-        mask = np.zeros((self.target_frames,), dtype=np.float32)
+        # Slice the data and cast to the correct Data Types
+        actual_coords = raw_tensor[:, :, 1:3].float()
+        actual_roles = raw_tensor[:, :, 3].long()
 
+        # Truncate or Pad to hit exactly 100 frames
         if current_frames >= self.target_frames:
-            # TRUNCATE: Play is too long. Grab the LAST `target_frames` frames.
-            fixed_coords = coords[-self.target_frames:, :, :]
-            fixed_roles = roles[-self.target_frames:, :]
-            mask[:] = 1.0  # All frames are real
-
+            fixed_coords = actual_coords[-self.target_frames:, :, :]
+            fixed_roles = actual_roles[-self.target_frames:, :]
         else:
-            # PAD: Play is too short. Put the data at the end, leave zeros at the start.
-            fixed_coords[-current_frames:, :, :] = coords
-            fixed_roles[-current_frames:, :] = roles
-            mask[-current_frames:] = 1.0  # Only the end frames are real
+            fixed_coords[-current_frames:, :, :] = actual_coords
+            fixed_roles[-current_frames:, :] = actual_roles
 
-        # Convert to PyTorch Tensors
         return {
-            'coordinates': torch.tensor(fixed_coords),
-            'roles': torch.tensor(fixed_roles),
-            'mask': torch.tensor(mask),
-            'sequence_id': play['sequence_id']
+            'coordinates': fixed_coords,
+            'roles': fixed_roles,
+            'sequence_id': seq_id
         }
-
-
-# --- How to use it ---
-# Assuming 'my_plays' is the output from your previous script
-
-import pickle
-
-file_path = "my_plays.pkl"
-
-with open(file_path, 'rb') as f: # Open in binary read mode ('rb')
-    my_plays = pickle.load(f)
-
-
-dataset = TacticalPlayDataset(my_plays, target_frames=100)
-
-# Create a DataLoader to automatically batch your data
-dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-
-# Test it out!
-for batch in dataloader:
-    print("Batch Coordinates Shape:", batch['coordinates'].shape)
-    print("Batch Roles Shape:", batch['roles'].shape)
-    break
